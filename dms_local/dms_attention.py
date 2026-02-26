@@ -419,6 +419,7 @@ def dms_attention(
     dms_cache: DMSCache,
     attn_scaling: float,
     window_size: int,
+    profiler=None,
 ) -> tuple[torch.Tensor, Optional[tuple[int, list[torch.Tensor]]]]:
     """
     Picks the attention implementation to use based on the new sequence length.
@@ -444,6 +445,10 @@ def dms_attention(
         )
 
         layer_cache: DMSPagedCacheLayer = dms_cache[layer_idx]
+
+        if profiler is not None:
+            k_cache, _, cache_seq_lengths, _ = layer_cache.get_contiguous_cache()
+            profiler.capture(new_q, k_cache, cache_seq_lengths, layer_idx, decisions)
 
         attn_output = flash_attn_with_kvcache(
             new_q_flash,

@@ -155,6 +155,7 @@ class Qwen3Attention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.q_per_kv = self.num_attention_heads // self.num_key_value_heads
+        self.profiler = None
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -202,6 +203,7 @@ class Qwen3Attention(nn.Module):
             dms_cache=past_key_values,
             attn_scaling=self.scaling,
             window_size=self.config.dms_window_size,
+            profiler=self.profiler,
         )
 
         dms_process_post_attention_data_fn = (
@@ -311,6 +313,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
+        # Cache offloading attribute (set externally like the profiler pattern)
+        self.offload_cache = False
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -336,6 +341,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values = DMSCache(
                 dms_window_size=self.config.dms_window_size + 1,
                 max_context_length=self.config.max_position_embeddings,
+                offloading=self.offload_cache,
             )
 
         if cache_position is None:
@@ -371,7 +377,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        _offloading = getattr(past_key_values, 'offloading', False)
+
+        for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            # Move current layer's cache to GPU before processing (skip during prefill — layers don't exist yet)
+            if _offloading and idx < len(past_key_values.layers):
+                past_key_values.layers[idx].prefetch()
+                torch.cuda.synchronize()  # ensure transfer complete before compute
+
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -382,6 +395,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+
+            # After processing, offload current layer to CPU and pre-move next layer to GPU
+            if _offloading and len(past_key_values.layers) > 0:
+                past_key_values.layers[idx].offload()
+                if idx + 1 < len(past_key_values.layers):
+                    past_key_values.layers[idx + 1].prefetch()
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(

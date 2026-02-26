@@ -100,8 +100,9 @@ def _scatter_by_index_kernel(
     idx_stride_b, idx_stride_s,
     BLOCK_D: tl.constexpr,
 ):
-    b = tl.program_id(0)
-    j = tl.program_id(1)
+    # Grid: (max_idx_len, B) — max_idx_len in X to avoid CUDA grid Y limit (65535)
+    j = tl.program_id(0)
+    b = tl.program_id(1)
 
     idx_len = tl.load(idx_lens_ptr + b)
     active = j < idx_len
@@ -148,7 +149,7 @@ def scatter_by_index(
 
     BLOCK_D = min(triton.next_power_of_2(D), 128)
 
-    grid = (B, max_idx_len)
+    grid = (max_idx_len, B)
     _scatter_by_index_kernel[grid](
         src, dst, indices_i32, idx_lens_i32,
         S_src, dst_seq_len, D,
@@ -176,9 +177,10 @@ def _bool_gather_left_pad_kernel(
     gidx_stride_b, gidx_stride_s,
     BLOCK_D: tl.constexpr,
 ):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    j = tl.program_id(2)  # index into gathered positions
+    # Grid: (max_count, B, H) — max_count in X to avoid CUDA grid Y/Z limit (65535)
+    j = tl.program_id(0)  # index into gathered positions
+    b = tl.program_id(1)
+    h = tl.program_id(2)
 
     count = tl.load(counts_ptr + b)
     active = j < count
@@ -233,7 +235,7 @@ def bool_gather_left_pad(
 
     BLOCK_D = min(triton.next_power_of_2(D), 128)
 
-    grid = (B, H, max_count)
+    grid = (max_count, B, H)
     _bool_gather_left_pad_kernel[grid](
         src, dst, gather_i32, counts_i32,
         H, S, D, max_count,
@@ -261,8 +263,9 @@ def _compact_by_bool_kernel(
     dst_stride_n, dst_stride_s,
     gidx_stride_n, gidx_stride_s,
 ):
-    n = tl.program_id(0)
-    j = tl.program_id(1)
+    # Grid: (max_count, N) — max_count in X to avoid CUDA grid Y limit (65535)
+    j = tl.program_id(0)
+    n = tl.program_id(1)
 
     count = tl.load(counts_ptr + n)
     active = j < count
@@ -300,7 +303,7 @@ def compact_by_bool(
     counts_i32 = counts.to(torch.int32).contiguous()
     gather_i32 = gather_indices.to(torch.int32).contiguous()
 
-    grid = (N, max_count)
+    grid = (max_count, N)
     _compact_by_bool_kernel[grid](
         src, dst, gather_i32, counts_i32,
         N, S, max_count,

@@ -375,6 +375,20 @@ class DMSCache(Cache):
     def __iter__(self):
         raise NotImplementedError("Not Supported")
 
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        """Override Cache.update() to skip built-in offloading.
+
+        The base class offloads the layer to CPU immediately after update(),
+        but DMS needs the cache on GPU for flash_attn_with_kvcache() which
+        runs after update(). Offloading is handled in the decoder loop instead.
+        """
+        if self.layer_class_to_replicate is not None:
+            while len(self.layers) <= layer_idx:
+                self.layers.append(self.layer_class_to_replicate())
+
+        keys, values = self.layers[layer_idx].update(key_states, value_states, cache_kwargs)
+        return keys, values
+
     def __getitem__(self, layer_idx: int):
         assert layer_idx < len(self.layers)
         return self.layers[layer_idx]
@@ -682,8 +696,18 @@ class DMSPagedCacheLayer(CacheLayerMixin):
             permutation = torch.arange(max_length, device=blocks.device, dtype=torch.int32)[None, :]
             permutation = torch.minimum(permutation, self.cache_seq_lengths[:, None] - 1)
             permutation = torch.broadcast_to(permutation, (self.page_batch, max_length))
-            non_window_positions = permutation[:, :, None] != window_positions[:, None, :]
-            non_window_positions = non_window_positions.to(torch.int32).min(dim=-1).values.to(torch.bool)
+            # Mark which position *values* are window positions using scatter,
+            # then look up each permutation value — O(page_batch × max_length)
+            # instead of the old O(page_batch × max_length × window_size) broadcast.
+            is_window = torch.zeros(
+                self.page_batch, max_length, dtype=torch.bool, device=self.device
+            )
+            valid_window_pos = torch.clamp(window_positions.long(), 0, max_length - 1)
+            is_window.scatter_(1, valid_window_pos, True)
+            # gather by permutation values so padded positions (clamped to
+            # cache_seq_lengths-1, which is always a window position) stay
+            # correctly marked as window entries — matches old behaviour.
+            non_window_positions = ~torch.gather(is_window, 1, permutation.long())
 
             result_permutation = torch.zeros_like(permutation)
             result_permutation[page_batch_index[:, None], permutation_index] = window_positions
